@@ -6,10 +6,22 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { parseCarrierEmail } = require('./emailParser');
+const auth = require('./auth');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
+
+// Validate config on startup
+try {
+  auth.validateSecurityConfig();
+  } catch (error) {
+    console.error('Security config error:', error.message);
+      process.exit(1);
+      }
+
+      // Apply rate limiting
+      app.use('/api/', auth.apiLimiter);
 
 // ─── Supabase Client ────────────────────────────────────────────────────────
 const supabase = createClient(
@@ -119,9 +131,9 @@ app.post('/webhook/email', async (req, res) => {
 // ─── Packages API ───────────────────────────────────────────────────────────
 
 // GET /api/packages — returns all packages for the authenticated user
-app.get('/api/packages', async (req, res) => {
+app.get('/api/packages', auth.authMiddleware, async (req, res) => {
   try {
-    const userId = req.headers['x-user-id'];
+    const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
     const { data, error } = await supabase
@@ -140,9 +152,9 @@ app.get('/api/packages', async (req, res) => {
 });
 
 // PATCH /api/packages/:id — update a package (e.g. set a nickname or archive it)
-app.patch('/api/packages/:id', async (req, res) => {
+app.patch('/api/packages/:id', auth.authMiddleware, async (req, res) => {
   try {
-    const userId = req.headers['x-user-id'];
+    const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
     const { nickname, archived, deleted } = req.body;
@@ -165,9 +177,9 @@ app.patch('/api/packages/:id', async (req, res) => {
 });
 
 // DELETE /api/packages/:id — remove a package
-app.delete('/api/packages/:id', async (req, res) => {
+app.delete('/api/packages/:id', auth.authMiddleware, async (req, res) => {
   try {
-    const userId = req.headers['x-user-id'];
+    const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
     const { error } = await supabase
@@ -238,7 +250,7 @@ app.post('/api/auth/signup', async (req, res) => {
 // GET /api/auth/profile — get current user's profile including their tracking email
 app.get('/api/auth/profile', async (req, res) => {
   try {
-    const userId = req.headers['x-user-id'];
+    const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
     const { data, error } = await supabase
