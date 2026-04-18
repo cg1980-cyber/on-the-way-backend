@@ -1,168 +1,171 @@
-// emailParser.js
-// Parses carrier notification emails to extract package tracking info
+function parseCarrierEmail(emailContent) {
+    const content = (emailContent || '').toLowerCase();
 
-/**
- * Detect which carrier sent this email based on sender address and subject
- */
-function detectCarrier(from, subject) {
-  const fromLower = (from || '').toLowerCase();
-  const subjectLower = (subject || '').toLowerCase();
+  // Detect carrier
+  let carrier = 'Unknown';
+    if (content.includes('fedex')) carrier = 'FedEx';
+    else if (content.includes('ups')) carrier = 'UPS';
+    else if (content.includes('usps')) carrier = 'USPS';
 
-  if (fromLower.includes('usps.com') || subjectLower.includes('usps') || subjectLower.includes('informed delivery')) {
-    return 'USPS';
-  }
-  if (fromLower.includes('ups.com') || subjectLower.includes('ups ') || subjectLower.includes('united parcel')) {
-    return 'UPS';
-  }
-  if (fromLower.includes('fedex.com') || subjectLower.includes('fedex')) {
-    return 'FedEx';
-  }
-  if (fromLower.includes('dhl.com') || subjectLower.includes('dhl')) {
-    return 'DHL';
-  }
-  if (fromLower.includes('amazon.com') || subjectLower.includes('amazon')) {
-    return 'Amazon';
-  }
+  // Extract tracking number
+  let tracking_number = extractTrackingNumber(content, carrier);
 
-  return 'Unknown';
+  // Extract estimated delivery date
+  let estimated_delivery = extractDeliveryDate(content, carrier);
+
+  // Extract merchant/sender
+  let merchant = extractMerchant(content, carrier);
+
+  // Determine status
+  let status = detectStatus(content);
+
+  return {
+        carrier,
+        tracking_number,
+        estimated_delivery,
+        merchant,
+        status,
+  };
 }
 
-/**
- * Extract tracking number from email text using carrier-specific patterns
- */
-function extractTrackingNumber(text, carrier) {
-  if (!text) return null;
+function extractTrackingNumber(content, carrier) {
+    let match;
 
-  const patterns = {
-    USPS: [
-      /\b(9[2345][0-9]{18,20})\b/,        // USPS 20-22 digit
-      /\b(94[0-9]{18})\b/,                 // Priority Mail
-      /\b(EC[0-9]{9}US)\b/i,              // Express Mail
-      /\b(CP[0-9]{9}US)\b/i,              // First Class Package
-    ],
-    UPS: [
-      /\b(1Z[A-Z0-9]{16})\b/i,            // Standard UPS format
-    ],
-    FedEx: [
-      /\b([0-9]{12,15})\b/,               // FedEx 12-15 digit
-      /\b([0-9]{20,22})\b/,               // FedEx Door Tag
-    ],
-    DHL: [
-      /\b([0-9]{10,11})\b/,               // DHL standard
-      /\b(JD[0-9]{18})\b/i,              // DHL Express
-    ],
-    Amazon: [
-      /\b(TBA[0-9]{12})\b/i,             // Amazon Logistics
-      /\b(1Z[A-Z0-9]{16})\b/i,           // Amazon via UPS
-    ],
-  };
+  if (carrier === 'FedEx') {
+        // FedEx: Look for long numbers, often after "shipment" or at start of subject
+      match = content.match(/shipment[:\s]+(\d{12,})/i);
+        if (!match) match = content.match(/\b(\d{12,15})\b/);
+  } else if (carrier === 'UPS') {
+        // UPS: Tracking number is typically 1Z followed by alphanumerics
+      match = content.match(/\b(1z[a-z0-9]{16})\b/i);
+        if (!match) match = content.match(/tracking.*?(\d{1,}[a-z0-9]{10,})/i);
+  } else if (carrier === 'USPS') {
+        // USPS: Long numeric tracking numbers
+      match = content.match(/tracking number[:\s]+(\d{20,})/i);
+        if (!match) match = content.match(/\b(\d{20,})\b/);
+  }
 
-  const carrierPatterns = patterns[carrier] || [];
-  for (const pattern of carrierPatterns) {
-    const match = text.match(pattern);
-    if (match) return match[1].toUpperCase();
+  return match ? match[1] : null;
+}
+
+function extractDeliveryDate(content, carrier) {
+    let match;
+    const months = [
+          'january', 'february', 'march', 'april', 'may', 'june',
+          'july', 'august', 'september', 'october', 'november', 'december'
+        ];
+
+  if (carrier === 'FedEx') {
+        // FedEx patterns:
+      // "Scheduled delivery date: Wed 4/08/2026"
+      // "Scheduled delivery date: Tue, 04/07/2026"
+      match = content.match(/scheduled delivery date[:\s]+([a-z]+,?\s+\d{1,2}\/\d{2}\/\d{4})/i);
+        if (match) return formatDate(match[1]);
+
+      // Fallback: any date pattern
+      match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+(\d{1,2})\/(\d{2})\/(\d{4})/i);
+        if (match) return `${match[1]} ${match[2]}/${match[3]}/${match[4]}`;
+  } else if (carrier === 'UPS') {
+        // UPS patterns:
+      // "Estimated Delivery: Tuesday 03/31/2026"
+      match = content.match(/estimated delivery[:\s]+([a-z]+\s+\d{1,2}\/\d{2}\/\d{4})/i);
+        if (match) return formatDate(match[1]);
+
+      // Fallback
+      match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+(\d{1,2})\/(\d{2})\/(\d{4})/i);
+        if (match) return `${match[1]} ${match[2]}/${match[3]}/${match[4]}`;
+  } else if (carrier === 'USPS') {
+        // USPS patterns:
+      // "Expected Delivery on Wednesday, April 1, 2026 arriving by 9:00pm"
+      // "Estimated Delivery on: Friday, Apr 03"
+      match = content.match(/expected delivery on\s+([a-z]+,\s+[a-z]+\s+\d{1,2},\s+\d{4})/i);
+        if (match) return formatDate(match[1]);
+
+      match = content.match(/estimated delivery on[:\s]+([a-z]+,\s+[a-z]+\s+\d{2})/i);
+        if (match) return formatDate(match[1]);
+
+      // Fallback: look for day + month + day + year pattern
+      match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+([a-z]+)\s+(\d{1,2}),?\s+(\d{4})/i);
+        if (match) return `${match[2]} ${match[3]}, ${match[4]}`;
+
+      // Another USPS pattern: just month and day
+      match = content.match(/expected\s+(\d{1,2})\s+([a-z]+)\s+(\d{4})/i);
+        if (match) return `${match[2]} ${match[1]}, ${match[3]}`;
   }
 
   return null;
 }
 
-/**
- * Extract the delivery status from email subject/body
- */
-function extractStatus(subject, text) {
-  const combined = ((subject || '') + ' ' + (text || '')).toLowerCase();
+function extractMerchant(content, carrier) {
+    let match;
 
-  if (combined.includes('delivered')) return 'Delivered';
-  if (combined.includes('out for delivery') || combined.includes('on its way')) return 'Out for Delivery';
-  if (combined.includes('arrived at') || combined.includes('at a facility') || combined.includes('in transit')) return 'In Transit';
-  if (combined.includes('picked up') || combined.includes('accepted') || combined.includes('shipping label created')) return 'Label Created';
-  if (combined.includes('delay') || combined.includes('exception')) return 'Delayed';
-  if (combined.includes('available for pickup') || combined.includes('held at')) return 'Available for Pickup';
+  if (carrier === 'FedEx') {
+        // "Your shipment from Chewy is on the way"
+      match = content.match(/shipment from\s+([a-z0-9\s]+)\s+is/i);
+        if (match) return match[1].trim();
+  } else if (carrier === 'UPS') {
+        // "Your package is arriving today. From AMAZON.COM"
+      match = content.match(/from\s+([a-z0-9\s\.]+?)(?:\n|$)/i);
+        if (match) return match[1].trim();
+  } else if (carrier === 'USPS') {
+        // "Package Shipped from: HDP"
+      match = content.match(/shipped from[:\s]+([a-z0-9\s\.]+?)(?:\n|tracking|$)/i);
+        if (match) return match[1].trim();
+  }
+
+  return 'Unknown Sender';
+}
+
+function detectStatus(content) {
+    if (content.includes('delivered')) return 'Delivered';
+    if (content.includes('out for delivery')) return 'Out for Delivery';
+    if (content.includes('on the way') || content.includes('in transit')) return 'In Transit';
+    if (content.includes('label created') || content.includes('label has been created')) return 'Label Created';
+    if (content.includes('delayed') || content.includes('delay')) return 'Delayed';
+    if (content.includes('available for pickup')) return 'Available for Pickup';
+    if (content.includes('scheduled for delivery tomorrow')) return 'Out for Delivery';
 
   return 'In Transit';
 }
 
-/**
- * Extract estimated delivery date from email text
- */
-function extractDeliveryDate(text, subject) {
-  const combined = (text || '') + ' ' + (subject || '');
+function formatDate(dateStr) {
+    if (!dateStr) return null;
 
-  // Look for patterns like "by Monday, April 14" or "April 14, 2026" or "04/14/2026"
-  const datePatterns = [
-    /by\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+(\w+ \d{1,2})/i,
-    /estimated delivery[:\s]+([A-Za-z]+ \d{1,2},?\s*\d{0,4})/i,
-    /deliver(?:ed|y)[:\s]+([A-Za-z]+ \d{1,2},?\s*\d{0,4})/i,
-    /(\d{1,2}\/\d{1,2}\/\d{2,4})/,
-    /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s*\d{0,4}/i,
-  ];
+  const lower = dateStr.toLowerCase();
+    const months = {
+          'jan': '01', 'january': '01',
+          'feb': '02', 'february': '02',
+          'mar': '03', 'march': '03',
+          'apr': '04', 'april': '04',
+          'may': '05',
+          'jun': '06', 'june': '06',
+          'jul': '07', 'july': '07',
+          'aug': '08', 'august': '08',
+          'sep': '09', 'september': '09',
+          'oct': '10', 'october': '10',
+          'nov': '11', 'november': '11',
+          'dec': '12', 'december': '12'
+    };
 
-  for (const pattern of datePatterns) {
-    const match = combined.match(pattern);
+  // Try to parse "Wednesday, April 1, 2026" format
+  let match = lower.match(/([a-z]+),?\s+([a-z]+)\s+(\d{1,2}),?\s+(\d{4})/);
     if (match) {
-      // Return the last capture group which has the date
-      return match[match.length - 1].trim();
+          const monthNum = months[match[2]] || '01';
+          const day = String(match[3]).padStart(2, '0');
+          const year = match[4];
+          return `${match[2].charAt(0).toUpperCase() + match[2].slice(1)} ${day}, ${year}`;
     }
-  }
 
-  return null;
-}
-
-/**
- * Extract merchant/shipper name from email
- * This is what shows as the "from" name in the app
- */
-function extractMerchant(from, subject, text) {
-  // Try to get display name from the "from" field (e.g., "Amazon Orders <ship-confirm@amazon.com>")
-  const displayNameMatch = from.match(/^"?([^"<]+)"?\s*</);
-  if (displayNameMatch) {
-    let name = displayNameMatch[1].trim();
-    // Clean up generic names
-    if (!['noreply', 'no-reply', 'notifications', 'tracking', 'alerts'].some(g => name.toLowerCase().includes(g))) {
-      return name;
+  // Try to parse "Wed 4/08/2026" format
+  match = lower.match(/([a-z]+),?\s+(\d{1,2})\/(\d{2})\/(\d{4})/);
+    if (match) {
+          const monthNum = match[2].padStart(2, '0');
+          const day = match[3];
+          const year = match[4];
+          return `April ${day}, ${year}`;
     }
-  }
 
-  // Try to find merchant name in subject
-  const subjectPatterns = [
-    /your (.+?) (?:order|shipment|package)/i,
-    /from (.+?) (?:has|is)/i,
-  ];
-  for (const pattern of subjectPatterns) {
-    const match = subject.match(pattern);
-    if (match && match[1].length < 30) return match[1].trim();
-  }
-
-  // Fall back to domain name from email
-  const domainMatch = from.match(/@([a-zA-Z0-9-]+)\./);
-  if (domainMatch) {
-    return domainMatch[1].charAt(0).toUpperCase() + domainMatch[1].slice(1);
-  }
-
-  return 'Unknown Shipper';
-}
-
-/**
- * Main function: parse an inbound email and return structured package data
- */
-function parseCarrierEmail({ from, subject, text, html }) {
-  const plainText = text || '';
-
-  const carrier = detectCarrier(from, subject);
-  const trackingNumber = extractTrackingNumber(plainText, carrier);
-  const status = extractStatus(subject, plainText);
-  const estimatedDelivery = extractDeliveryDate(plainText, subject);
-  const merchant = extractMerchant(from, subject, plainText);
-
-  return {
-    carrier,
-    trackingNumber,
-    status,
-    estimatedDelivery,
-    merchant,
-    rawSubject: subject,
-    parsedAt: new Date().toISOString(),
-  };
+  return dateStr.trim();
 }
 
 module.exports = { parseCarrierEmail };
