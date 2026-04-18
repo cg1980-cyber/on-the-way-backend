@@ -268,6 +268,86 @@ app.get('/api/auth/profile', auth.authMiddleware, async (req, res) => {
   }
 });
 
+// --- Webhook Handler ---
+// Receives package updates from carriers with HMAC-SHA256 signature verification
+app.post('/api/webhooks', async (req, res) => {
+  try {
+      const signature = req.headers['x-webhook-signature'];
+          
+              // Require signature header
+                  if (!signature) {
+                        return res.status(401).json({ error: 'Missing webhook signature' });
+                            }
+                                
+                                    const payload = JSON.stringify(req.body);
+                                        
+                                            // Verify webhook signature using HMAC-SHA256
+                                                try {
+                                                      auth.verifyWebhookSignature(
+                                                              payload,
+                                                                      signature,
+                                                                              process.env.WEBHOOK_SECRET
+                                                                                    );
+                                                                                        } catch (signatureError) {
+                                                                                              console.error('Webhook signature verification failed:', signatureError.message);
+                                                                                                    return res.status(401).json({ error: 'Invalid webhook signature' });
+                                                                                                        }
+                                                                                                            
+                                                                                                                // Process the webhook payload
+                                                                                                                    const { tracking_number, status, estimated_delivery, carrier } = req.body;
+                                                                                                                        
+                                                                                                                            // Validate required webhook fields
+                                                                                                                                if (!tracking_number || !status) {
+                                                                                                                                      return res.status(400).json({ error: 'Missing required fields: tracking_number, status' });
+                                                                                                                                          }
+                                                                                                                                              
+                                                                                                                                                  // Update package status in database
+                                                                                                                                                      const { data: packages, error: queryError } = await supabase
+                                                                                                                                                            .from('packages')
+                                                                                                                                                                  .select('id, user_id')
+                                                                                                                                                                        .eq('tracking_number', tracking_number)
+                                                                                                                                                                              .single();
+                                                                                                                                                                                  
+                                                                                                                                                                                      if (queryError || !packages) {
+                                                                                                                                                                                            console.warn(`Package not found for tracking number: ${tracking_number}`);
+                                                                                                                                                                                                  return res.status(404).json({ error: 'Package not found' });
+                                                                                                                                                                                                      }
+                                                                                                                                                                                                          
+                                                                                                                                                                                                              // Update package with new status
+                                                                                                                                                                                                                  const updateData = {
+                                                                                                                                                                                                                        status: status,
+                                                                                                                                                                                                                              last_updated: new Date().toISOString()
+                                                                                                                                                                                                                                  };
+                                                                                                                                                                                                                                      
+                                                                                                                                                                                                                                          if (estimated_delivery) {
+                                                                                                                                                                                                                                                updateData.estimated_delivery = estimated_delivery;
+                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                            const { error: updateError } = await supabase
+                                                                                                                                                                                                                                                                  .from('packages')
+                                                                                                                                                                                                                                                                        .update(updateData)
+                                                                                                                                                                                                                                                                              .eq('id', packages.id);
+                                                                                                                                                                                                                                                                                  
+                                                                                                                                                                                                                                                                                      if (updateError) {
+                                                                                                                                                                                                                                                                                            throw updateError;
+                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                    
+                                                                                                                                                                                                                                                                                                        // Log successful webhook processing
+                                                                                                                                                                                                                                                                                                            console.log(`Webhook processed: ${tracking_number} -> ${status}`);
+                                                                                                                                                                                                                                                                                                                
+                                                                                                                                                                                                                                                                                                                    res.json({
+                                                                                                                                                                                                                                                                                                                          success: true,
+                                                                                                                                                                                                                                                                                                                                message: 'Package status updated successfully',
+                                                                                                                                                                                                                                                                                                                                      tracking_number,
+                                                                                                                                                                                                                                                                                                                                            status
+                                                                                                                                                                                                                                                                                                                                                });
+                                                                                                                                                                                                                                                                                                                                                    
+                                                                                                                                                                                                                                                                                                                                                      } catch (error) {
+                                                                                                                                                                                                                                                                                                                                                          console.error('Webhook processing error:', error);
+                                                                                                                                                                                                                                                                                                                                                              res.status(500).json({ error: 'Internal server error' });
+                                                                                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                                                                                });
+
 // ─── Start Server ────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
