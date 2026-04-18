@@ -13,7 +13,8 @@
     "express": "^4.18.2",
     "mailparser": "^3.6.5",
         "jsonwebtoken": "9.0.0",
-        "express-rate-limit": "^7.0.0"
+        "express-rate-limit": "^7.0.0",
+            "jose": "^5.9.6"
   },
   "engines": {
     "node": ">=18.0.0"
