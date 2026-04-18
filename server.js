@@ -248,7 +248,7 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 // GET /api/auth/profile — get current user's profile including their tracking email
-app.get('/api/auth/profile', async (req, res) => {
+app.get('/api/auth/profile', auth.authMiddleware, async (req, res) => {
   try {
     const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
