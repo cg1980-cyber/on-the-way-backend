@@ -51,7 +51,6 @@ function verifyToken(token) {
   try {
         return jwt.verify(token, JWT_SECRET, {
                 algorithms: ['HS256'],
-                issuer: 'on-the-way-app'
         });
   } catch (error) {
         if (error.name === 'TokenExpiredError') {
