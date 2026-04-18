@@ -159,6 +159,14 @@ const apiLimiter = rateLimit({
     message: 'Too many API requests',
     standardHeaders: true,
     legacyHeaders: false,
+        keyGenerator: (req) => {
+                  const forwarded = req.headers['x-forwarded-for'];
+                  if (forwarded) {
+                              const ips = typeof forwarded === 'string' ? forwarded.split(',') : forwarded;
+                              return (Array.isArray(ips) ? ips[0] : ips).trim();
+                  }
+                  return req.ip || req.connection.remoteAddress;
+        },
 });
 
 const webhookLimiter = rateLimit({
@@ -167,6 +175,14 @@ const webhookLimiter = rateLimit({
     message: 'Too many webhook requests',
     standardHeaders: true,
     legacyHeaders: false,
+      keyGenerator: (req) => {
+              const forwarded = req.headers['x-forwarded-for'];
+              if (forwarded) {
+                        const ips = typeof forwarded === 'string' ? forwarded.split(',') : forwarded;
+                        return (Array.isArray(ips) ? ips[0] : ips).trim();
+              }
+              return req.ip || req.connection.remoteAddress;
+      },
 });
 
 module.exports = {
