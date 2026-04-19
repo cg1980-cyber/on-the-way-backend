@@ -157,11 +157,11 @@ app.patch('/api/packages/:id', auth.authMiddleware, async (req, res) => {
     const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
-    const { nickname, archived, deleted } = req.body;
+    const { nickname, archived, deleted, note } = req.body;
 
     const { data, error } = await supabase
       .from('packages')
-      .update({ nickname, archived, deleted })
+      .update({ nickname, archived, deleted, note })
       .eq('id', req.params.id)
       .eq('user_id', userId)  // Ensures user can only update their own packages
       .select()
