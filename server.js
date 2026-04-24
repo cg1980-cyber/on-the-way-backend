@@ -65,8 +65,7 @@ app.post('/webhook/email', async (req, res) => {
     }
 
     // Parse the carrier email to extract package info
-    const parsed = parseCarrierEmail({ from, subject, text, html });
-
+    const parsed = parseCarrierEmail(`${from || ''} ${subject || ''} ${text || ''} ${html || ''}`);
     // Check if we already have a package with this tracking number for this user
     // to avoid duplicate entries from multiple status update emails
     let packageRecord;
