@@ -12,7 +12,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// Validate config on startup
+// Validate config on startuph
 try {
   auth.validateSecurityConfig();
   } catch (error) {
@@ -167,11 +167,11 @@ app.patch('/api/packages/:id', auth.authMiddleware, async (req, res) => {
     const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
-    const { nickname, archived, deleted, note } = req.body;
+    const { nickname, archived, deleted, note, merchant } = req.body;
 
     const { data, error } = await supabase
       .from('packages')
-      .update({ nickname, archived, deleted, note })
+      .update({ nickname, archived, deleted, note, merchant })
       .eq('id', req.params.id)
       .eq('user_id', userId)  // Ensures user can only update their own packages
       .select()
