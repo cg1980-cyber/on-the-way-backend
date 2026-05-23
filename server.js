@@ -66,16 +66,27 @@ app.post('/webhook/email', async (req, res) => {
 
     // Parse the carrier email to extract package info
     const parsed = parseCarrierEmail(`${from || ''} ${subject || ''} ${text || ''} ${html || ''}`);
+
+    // Reject emails the parser is not confident are real shipping notifications.
+    // Without this gate, every non-shipping email forwarded to the user's
+    // tracking address would create a junk row in `packages`.
+    if (!parsed.isShipping) {
+      console.log(
+        `Ignoring non-shipping email for ${user.email} (from=${from}, subject=${subject})`
+      );
+      return res.status(200).json({ message: 'Not a shipping email, ignoring' });
+    }
+
     // Check if we already have a package with this tracking number for this user
     // to avoid duplicate entries from multiple status update emails
     let packageRecord;
 
-    if (parsed.trackingNumber) {
+    if (parsed.tracking_number) {
       const { data: existing } = await supabase
         .from('packages')
         .select('id, status')
         .eq('user_id', user.id)
-        .eq('tracking_number', parsed.trackingNumber)
+        .eq('tracking_number', parsed.tracking_number)
         .single();
 
       if (existing) {
@@ -84,7 +95,7 @@ app.post('/webhook/email', async (req, res) => {
           .from('packages')
           .update({
             status: parsed.status,
-            estimated_delivery: parsed.estimatedDelivery,
+            estimated_delivery: parsed.estimated_delivery,
             last_updated: new Date().toISOString(),
           })
           .eq('id', existing.id)
@@ -93,7 +104,7 @@ app.post('/webhook/email', async (req, res) => {
 
         if (updateError) throw updateError;
         packageRecord = updated;
-        console.log(`Updated package ${parsed.trackingNumber} for user ${user.id}: ${parsed.status}`);
+        console.log(`Updated package ${parsed.tracking_number} for user ${user.id}: ${parsed.status}`);
       }
     }
 
@@ -103,11 +114,11 @@ app.post('/webhook/email', async (req, res) => {
         .from('packages')
         .insert({
           user_id: user.id,
-          tracking_number: parsed.trackingNumber || null,
+          tracking_number: parsed.tracking_number || null,
           carrier: parsed.carrier,
           status: parsed.status,
           merchant: parsed.merchant,
-          estimated_delivery: parsed.estimatedDelivery,
+          estimated_delivery: parsed.estimated_delivery,
           nickname: null,  // User can set this in the app
           last_updated: new Date().toISOString(),
         })

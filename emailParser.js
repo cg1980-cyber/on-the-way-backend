@@ -1,169 +1,248 @@
+// emailParser.js
+// Parses forwarded shipping-confirmation emails into structured package data.
+//
+// Returns an object that always includes an `isShipping` flag. Consumers
+// (server.js) should check that flag before persisting a row — otherwise
+// the database fills up with junk rows generated from non-shipping email.
+//
+// Fields use snake_case so they can be spread directly into the Supabase
+// `packages` row without case translation.
+
 function parseCarrierEmail(emailContent) {
-    const content = (emailContent || '').toLowerCase();
+  const raw = emailContent || '';
+  const content = raw.toLowerCase();
 
-  // Detect carrier
-  let carrier = 'Unknown';
-    if (content.includes('fedex')) carrier = 'FedEx';
-    else if (content.includes('ups')) carrier = 'UPS';
-    else if (content.includes('usps')) carrier = 'USPS';
+  // 1. Carrier detection — use word boundaries and carrier-specific phrases
+  //    to avoid matching "ups" inside "groups", "setups", "support", etc.
+  const carrier = detectCarrier(content);
 
-  // Extract tracking number
-  let tracking_number = extractTrackingNumber(content, carrier);
+  // 2. Tracking number — try carrier-specific patterns, then a generic fallback
+  const tracking_number = extractTrackingNumber(content, carrier);
 
-  // Extract estimated delivery date
-  let estimated_delivery = extractDeliveryDate(content, carrier);
+  // 3. Estimated delivery date
+  const estimated_delivery = extractDeliveryDate(content, carrier);
 
-  // Extract merchant/sender
-  let merchant = extractMerchant(content, carrier);
+  // 4. Merchant — guarded so we don't capture "from gmail" or "from my iphone"
+  //    out of random forwarded headers.
+  const merchant = extractMerchant(content, carrier);
 
-  // Determine status
-  let status = detectStatus(content);
+  // 5. Status
+  const status = detectStatus(content);
+
+  // 6. Shipping signal — only treat this as a real shipment if we have
+  //    BOTH a recognized carrier AND at least one shipping keyword,
+  //    OR a tracking-number-shaped string in the body.
+  const hasShippingKeyword = SHIPPING_KEYWORDS.some(k => content.includes(k));
+  const isShipping =
+    (carrier !== 'Unknown' && hasShippingKeyword) ||
+    !!tracking_number;
 
   return {
-        carrier,
-        tracking_number,
-        estimated_delivery,
-        merchant,
-        status,
+    carrier,
+    tracking_number,
+    estimated_delivery,
+    merchant,
+    status,
+    isShipping,
   };
 }
 
+const SHIPPING_KEYWORDS = [
+  'tracking number',
+  'tracking #',
+  'tracking:',
+  'shipped',
+  'shipment',
+  'on the way',
+  'out for delivery',
+  'estimated delivery',
+  'expected delivery',
+  'scheduled delivery',
+  'arriving',
+  'package',
+  'order has shipped',
+];
+
+function detectCarrier(content) {
+  // FedEx — distinctive token, word boundary to be safe.
+  if (/\bfedex\b/.test(content) || content.includes('fedex.com')) return 'FedEx';
+
+  // UPS — require word boundary OR a UPS-specific phrase / tracking shape,
+  // because "ups" is a substring of many innocent words ("groups",
+  // "setups", "support"...).
+  if (
+    /\bups\b/.test(content) ||
+    content.includes('ups.com') ||
+    content.includes('ups my choice') ||
+    /\b1z[a-z0-9]{16}\b/i.test(content) // UPS tracking-number shape
+  ) {
+    return 'UPS';
+  }
+
+  // USPS — same precaution.
+  if (
+    /\busps\b/.test(content) ||
+    content.includes('usps.com') ||
+    content.includes('united states postal service') ||
+    content.includes('postal service')
+  ) {
+    return 'USPS';
+  }
+
+  return 'Unknown';
+}
+
 function extractTrackingNumber(content, carrier) {
-    let match;
+  let match;
 
   if (carrier === 'FedEx') {
-        // FedEx: Look for long numbers, often after "shipment" or at start of subject
-      match = content.match(/shipment[:\s]+(\d{12,})/i);
-        if (!match) match = content.match(/\b(\d{12,15})\b/);
+    match = content.match(/shipment[:\s]+(\d{12,})/i);
+    if (!match) match = content.match(/\b(\d{12,15})\b/);
   } else if (carrier === 'UPS') {
-        // UPS: Tracking number is typically 1Z followed by alphanumerics
-      match = content.match(/\b(1z[a-z0-9]{16})\b/i);
-        if (!match) match = content.match(/tracking.*?(\d{1,}[a-z0-9]{10,})/i);
+    match = content.match(/\b(1z[a-z0-9]{16})\b/i);
+    if (!match) match = content.match(/tracking.*?(\d{1,}[a-z0-9]{10,})/i);
   } else if (carrier === 'USPS') {
-        // USPS: Long numeric tracking numbers
-      match = content.match(/tracking number[:\s]+(\d{20,})/i);
-        if (!match) match = content.match(/\b(\d{20,})\b/);
+    match = content.match(/tracking number[:\s]+(\d{20,})/i);
+    if (!match) match = content.match(/\b(\d{20,})\b/);
+  } else {
+    // Generic fallback: look for any tracking-number-shaped string
+    // labelled as such.
+    match = content.match(/tracking number[:\s]+([a-z0-9]{10,})/i);
+    if (!match) match = content.match(/\b(1z[a-z0-9]{16})\b/i);
+    if (!match) match = content.match(/\b(\d{20,})\b/);
   }
 
   return match ? match[1] : null;
 }
 
 function extractDeliveryDate(content, carrier) {
-    let match;
-    const months = [
-          'january', 'february', 'march', 'april', 'may', 'june',
-          'july', 'august', 'september', 'october', 'november', 'december'
-        ];
+  let match;
 
   if (carrier === 'FedEx') {
-        // FedEx patterns:
-      // "Scheduled delivery date: Wed 4/08/2026"
-      // "Scheduled delivery date: Tue, 04/07/2026"
-      match = content.match(/scheduled delivery date[:\s]+([a-z]+,?\s+\d{1,2}\/\d{2}\/\d{4})/i);
-        if (match) return formatDate(match[1]);
+    match = content.match(/scheduled delivery date[:\s]+([a-z]+,?\s+\d{1,2}\/\d{2}\/\d{4})/i);
+    if (match) return formatDate(match[1]);
 
-      // Fallback: any date pattern
-      match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+(\d{1,2})\/(\d{2})\/(\d{4})/i);
-        if (match) return `${match[1]} ${match[2]}/${match[3]}/${match[4]}`;
+    match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+(\d{1,2})\/(\d{2})\/(\d{4})/i);
+    if (match) return `${match[1]} ${match[2]}/${match[3]}/${match[4]}`;
   } else if (carrier === 'UPS') {
-        // UPS patterns:
-      // "Estimated Delivery: Tuesday 03/31/2026"
-      match = content.match(/estimated delivery[:\s]+([a-z]+\s+\d{1,2}\/\d{2}\/\d{4})/i);
-        if (match) return formatDate(match[1]);
+    match = content.match(/estimated delivery[:\s]+([a-z]+\s+\d{1,2}\/\d{2}\/\d{4})/i);
+    if (match) return formatDate(match[1]);
 
-      // Fallback
-      match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+(\d{1,2})\/(\d{2})\/(\d{4})/i);
-        if (match) return `${match[1]} ${match[2]}/${match[3]}/${match[4]}`;
+    match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+(\d{1,2})\/(\d{2})\/(\d{4})/i);
+    if (match) return `${match[1]} ${match[2]}/${match[3]}/${match[4]}`;
   } else if (carrier === 'USPS') {
-        // USPS patterns:
-      // "Expected Delivery on Wednesday, April 1, 2026 arriving by 9:00pm"
-      // "Estimated Delivery on: Friday, Apr 03"
-      match = content.match(/expected delivery on\s+([a-z]+,\s+[a-z]+\s+\d{1,2},\s+\d{4})/i);
-        if (match) return formatDate(match[1]);
+    match = content.match(/expected delivery on\s+([a-z]+,\s+[a-z]+\s+\d{1,2},\s+\d{4})/i);
+    if (match) return formatDate(match[1]);
 
-      match = content.match(/estimated delivery on[:\s]+([a-z]+,\s+[a-z]+\s+\d{2})/i);
-        if (match) return formatDate(match[1]);
+    match = content.match(/estimated delivery on[:\s]+([a-z]+,\s+[a-z]+\s+\d{2})/i);
+    if (match) return formatDate(match[1]);
 
-      // Fallback: look for day + month + day + year pattern
-      match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+([a-z]+)\s+(\d{1,2}),?\s+(\d{4})/i);
-        if (match) return `${match[2]} ${match[3]}, ${match[4]}`;
+    match = content.match(/(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+([a-z]+)\s+(\d{1,2}),?\s+(\d{4})/i);
+    if (match) return `${match[2]} ${match[3]}, ${match[4]}`;
 
-      // Another USPS pattern: just month and day
-      match = content.match(/expected\s+(\d{1,2})\s+([a-z]+)\s+(\d{4})/i);
-        if (match) return `${match[2]} ${match[1]}, ${match[3]}`;
+    match = content.match(/expected\s+(\d{1,2})\s+([a-z]+)\s+(\d{4})/i);
+    if (match) return `${match[2]} ${match[1]}, ${match[3]}`;
   }
 
   return null;
 }
 
+// Generic / forwarded-mail provider words we should NEVER treat as a merchant.
+// Most show up because the parser sees lines like "Sent from my iPhone" or
+// "Forwarded from gmail" in the body of forwarded shipping emails.
+const MERCHANT_BLOCKLIST = new Set([
+  'gmail', 'yahoo', 'outlook', 'hotmail', 'aol', 'icloud',
+  'google', 'apple', 'microsoft',
+  'my iphone', 'my ipad', 'my android', 'my phone',
+  'mail', 'email', 'noreply', 'no-reply', 'no reply',
+  'unknown sender', 'unknown',
+]);
+
 function extractMerchant(content, carrier) {
-    let match;
+  let candidate = null;
+  let match;
 
   if (carrier === 'FedEx') {
-        // "Your shipment from Chewy is on the way"
-      match = content.match(/shipment from\s+([a-z0-9\s]+)\s+is/i);
-        if (match) return match[1].trim();
+    match = content.match(/shipment from\s+([a-z0-9\s]+?)\s+is/i);
+    if (match) candidate = match[1].trim();
   } else if (carrier === 'UPS') {
-        // "Your package is arriving today. From AMAZON.COM"
-      match = content.match(/from\s+([a-z0-9\s\.]+?)(?:\n|$)/i);
-        if (match) return match[1].trim();
+    // Prefer "from <merchant>" near a "shipped" or "package" cue rather
+    // than any "from" anywhere.
+    match = content.match(/(?:package|shipment|order)\s+from\s+([a-z0-9\s\.]+?)(?:\n|\r|\.|,|$)/i);
+    if (match) candidate = match[1].trim();
   } else if (carrier === 'USPS') {
-        // "Package Shipped from: HDP"
-      match = content.match(/shipped from[:\s]+([a-z0-9\s\.]+?)(?:\n|tracking|$)/i);
-        if (match) return match[1].trim();
+    match = content.match(/shipped from[:\s]+([a-z0-9\s\.]+?)(?:\n|\r|tracking|$)/i);
+    if (match) candidate = match[1].trim();
   }
 
-  return 'Unknown Sender';
+  // Cross-carrier fallback: "your order from <merchant>"
+  if (!candidate) {
+    match = content.match(/your (?:order|shipment|package) from\s+([a-z0-9\s\.]+?)(?:\n|\r|\.|,|is|has|$)/i);
+    if (match) candidate = match[1].trim();
+  }
+
+  if (!candidate) return null;
+
+  // Strip junk and reject if it lands in the blocklist.
+  const cleaned = candidate.replace(/\s+/g, ' ').trim();
+  if (!cleaned || MERCHANT_BLOCKLIST.has(cleaned.toLowerCase())) {
+    return null;
+  }
+
+  return cleaned;
 }
 
 function detectStatus(content) {
-    if (content.includes('delivered')) return 'Delivered';
-    if (content.includes('out for delivery')) return 'Out for Delivery';
-    if (content.includes('on the way') || content.includes('in transit')) return 'In Transit';
-    if (content.includes('label created') || content.includes('label has been created')) return 'Label Created';
-    if (content.includes('delayed') || content.includes('delay')) return 'Delayed';
-    if (content.includes('available for pickup')) return 'Available for Pickup';
-    if (content.includes('scheduled for delivery tomorrow')) return 'Out for Delivery';
+  if (content.includes('delivered')) return 'Delivered';
+  if (content.includes('out for delivery')) return 'Out for Delivery';
+  if (content.includes('on the way') || content.includes('in transit')) return 'In Transit';
+  if (content.includes('label created') || content.includes('label has been created')) return 'Label Created';
+  if (content.includes('delayed') || content.includes('delay')) return 'Delayed';
+  if (content.includes('available for pickup')) return 'Available for Pickup';
+  if (content.includes('scheduled for delivery tomorrow')) return 'Out for Delivery';
 
   return 'In Transit';
 }
 
 function formatDate(dateStr) {
-    if (!dateStr) return null;
+  if (!dateStr) return null;
 
   const lower = dateStr.toLowerCase();
-    const months = {
-          'jan': '01', 'january': '01',
-          'feb': '02', 'february': '02',
-          'mar': '03', 'march': '03',
-          'apr': '04', 'april': '04',
-          'may': '05',
-          'jun': '06', 'june': '06',
-          'jul': '07', 'july': '07',
-          'aug': '08', 'august': '08',
-          'sep': '09', 'september': '09',
-          'oct': '10', 'october': '10',
-          'nov': '11', 'november': '11',
-          'dec': '12', 'december': '12'
-    };
+  const months = {
+    'jan': '01', 'january': '01',
+    'feb': '02', 'february': '02',
+    'mar': '03', 'march': '03',
+    'apr': '04', 'april': '04',
+    'may': '05',
+    'jun': '06', 'june': '06',
+    'jul': '07', 'july': '07',
+    'aug': '08', 'august': '08',
+    'sep': '09', 'september': '09',
+    'oct': '10', 'october': '10',
+    'nov': '11', 'november': '11',
+    'dec': '12', 'december': '12'
+  };
 
-  // Try to parse "Wednesday, April 1, 2026" format
+  // "Wednesday, April 1, 2026"
   let match = lower.match(/([a-z]+),?\s+([a-z]+)\s+(\d{1,2}),?\s+(\d{4})/);
-    if (match) {
-          const monthNum = months[match[2]] || '01';
-          const day = String(match[3]).padStart(2, '0');
-          const year = match[4];
-          return `${match[2].charAt(0).toUpperCase() + match[2].slice(1)} ${day}, ${year}`;
-    }
+  if (match) {
+    const monthName = match[2];
+    const day = String(match[3]).padStart(2, '0');
+    const year = match[4];
+    return `${monthName.charAt(0).toUpperCase() + monthName.slice(1)} ${day}, ${year}`;
+  }
 
-  // Try to parse "Wed 4/08/2026" format
+  // "Wed 4/08/2026"
   match = lower.match(/([a-z]+),?\s+(\d{1,2})\/(\d{2})\/(\d{4})/);
-    if (match) {
-          const monthNum = match[2].padStart(2, '0');
-          const day = match[3];
-          const year = match[4];
-          return `April ${day}, ${year}`;
-    }
+  if (match) {
+    const monthNum = match[2].padStart(2, '0');
+    const day = match[3];
+    const year = match[4];
+    const monthName =
+      Object.keys(months).find(k => months[k] === monthNum && k.length > 3) ||
+      'Month';
+    return `${monthName.charAt(0).toUpperCase() + monthName.slice(1)} ${day}, ${year}`;
+  }
 
   return dateStr.trim();
 }
