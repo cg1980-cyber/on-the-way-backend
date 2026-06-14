@@ -7,6 +7,7 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { parseCarrierEmail } = require('./emailParser');
 const auth = require('./auth');
+const { createHouseholdRouter, getMembership } = require('./household');
 
 const app = express();
 app.use(cors());
@@ -28,6 +29,9 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY  // Service key bypasses RLS for server-side writes
 );
+
+// ─── Household routes (Pillar 1) ────────────────────────────────────────────
+app.use('/api/household', createHouseholdRouter(supabase, auth));
 
 // ─── Health Check ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -77,6 +81,11 @@ app.post('/webhook/email', async (req, res) => {
       return res.status(200).json({ message: 'Not a shipping email, ignoring' });
     }
 
+    // Resolve the recipient's household so packages land in the shared feed.
+    // Default recipient is whoever owns the tracking address that received the
+    // email; smart name-matching against other members can refine this later.
+    const membership = await getMembership(supabase, user.id);
+
     // Check if we already have a package with this tracking number for this user
     // to avoid duplicate entries from multiple status update emails
     let packageRecord;
@@ -114,6 +123,8 @@ app.post('/webhook/email', async (req, res) => {
         .from('packages')
         .insert({
           user_id: user.id,
+          household_id: membership ? membership.household_id : null,
+          recipient_member_id: membership ? membership.id : null,
           tracking_number: parsed.tracking_number || null,
           carrier: parsed.carrier,
           status: parsed.status,
@@ -146,14 +157,27 @@ app.get('/api/packages', auth.authMiddleware, async (req, res) => {
     const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
-    const { data, error } = await supabase
-      .from('packages')
-      .select('*')
-      .eq('user_id', userId)
-      .order('last_updated', { ascending: false });
+    const membership = await getMembership(supabase, userId);
 
+    let query = supabase.from('packages').select('*');
+    if (membership) {
+      // Whole household feed, plus any of the user's own pre-household packages.
+      query = query.or(
+        `household_id.eq.${membership.household_id},and(user_id.eq.${userId},household_id.is.null)`
+      );
+    } else {
+      query = query.eq('user_id', userId);
+    }
+
+    const { data, error } = await query.order('last_updated', { ascending: false });
     if (error) throw error;
-    res.json(data);
+
+    // Gift mode: hide packages the viewer has been explicitly excluded from.
+    const visible = membership
+      ? data.filter((p) => !(p.hidden_from || []).includes(membership.id))
+      : data;
+
+    res.json(visible);
 
   } catch (err) {
     console.error('Get packages error:', err);
@@ -167,13 +191,40 @@ app.patch('/api/packages/:id', auth.authMiddleware, async (req, res) => {
     const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
-    const { nickname, archived, deleted, note, merchant } = req.body;
+    const membership = await getMembership(supabase, userId);
+
+    // Authorize: the package adder, or any member of the package's household.
+    const { data: pkg, error: fErr } = await supabase
+      .from('packages')
+      .select('id, user_id, household_id')
+      .eq('id', req.params.id)
+      .single();
+    if (fErr || !pkg) return res.status(404).json({ error: 'Package not found' });
+
+    const isAdder = pkg.user_id === userId;
+    const sameHousehold =
+      membership && pkg.household_id && pkg.household_id === membership.household_id;
+    if (!isAdder && !sameHousehold) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
+    const { nickname, archived, deleted, note, merchant, recipient_member_id, hidden_from } = req.body;
+
+    // recipient_member_id, if set, must belong to the same household.
+    if (recipient_member_id && membership) {
+      const { data: m } = await supabase
+        .from('household_members')
+        .select('id')
+        .eq('id', recipient_member_id)
+        .eq('household_id', membership.household_id)
+        .maybeSingle();
+      if (!m) return res.status(400).json({ error: 'recipient_member_id not in your household' });
+    }
 
     const { data, error } = await supabase
       .from('packages')
-      .update({ nickname, archived, deleted, note, merchant })
+      .update({ nickname, archived, deleted, note, merchant, recipient_member_id, hidden_from })
       .eq('id', req.params.id)
-      .eq('user_id', userId)  // Ensures user can only update their own packages
       .select()
       .single();
 
@@ -192,11 +243,26 @@ app.delete('/api/packages/:id', auth.authMiddleware, async (req, res) => {
     const userId = auth.getUserId(req);
     if (!userId) return res.status(401).json({ error: 'Missing user ID' });
 
+    const membership = await getMembership(supabase, userId);
+
+    const { data: pkg, error: fErr } = await supabase
+      .from('packages')
+      .select('id, user_id, household_id')
+      .eq('id', req.params.id)
+      .single();
+    if (fErr || !pkg) return res.status(404).json({ error: 'Package not found' });
+
+    const isAdder = pkg.user_id === userId;
+    const isHouseholdOwner =
+      membership && membership.role === 'owner' && pkg.household_id === membership.household_id;
+    if (!isAdder && !isHouseholdOwner) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
     const { error } = await supabase
       .from('packages')
       .delete()
-      .eq('id', req.params.id)
-      .eq('user_id', userId);
+      .eq('id', req.params.id);
 
     if (error) throw error;
     res.json({ success: true });
@@ -244,6 +310,28 @@ app.post('/api/auth/signup', async (req, res) => {
       .single();
 
     if (profileError) throw profileError;
+
+    // Every new user gets their own household so Pillar 1 works from signup.
+    // The user is the owner; they can invite others later.
+    try {
+      const displayName = email.split('@')[0];
+      const { data: household } = await supabase
+        .from('households')
+        .insert({ name: `${displayName}'s Household` })
+        .select()
+        .single();
+      if (household) {
+        await supabase.from('household_members').insert({
+          household_id: household.id,
+          user_id: authData.user.id,
+          role: 'owner',
+          display_name: displayName,
+        });
+      }
+    } catch (hErr) {
+      // Non-fatal: the account exists; a household can be backfilled if this fails.
+      console.error('Household auto-create failed for new user:', hErr.message);
+    }
 
     res.json({
       success: true,
