@@ -247,6 +247,42 @@ function createHouseholdRouter(supabase, auth) {
     }
   });
 
+  // GET /api/household/my-invite — pending invitation for the caller's email, if any.
+  // Lets the app show a one-tap "Join" banner instead of making the user type a code.
+  router.get('/my-invite', auth.authMiddleware, async (req, res) => {
+    try {
+      const userEmail = (req.user.email || '').toLowerCase();
+      if (!userEmail) return res.json({ invite: null });
+
+      const { data: invites, error } = await supabase
+        .from('household_invitations')
+        .select('id, household_id, email, token, expires_at, accepted_at')
+        .ilike('email', userEmail)
+        .is('accepted_at', null);
+      if (error) throw error;
+
+      const valid = (invites || []).find((i) => new Date(i.expires_at) > new Date());
+      if (!valid) return res.json({ invite: null });
+
+      // Don't offer an invite to the household they're already in.
+      const membership = await getMembership(supabase, auth.getUserId(req));
+      if (membership && membership.household_id === valid.household_id) {
+        return res.json({ invite: null });
+      }
+
+      const { data: household } = await supabase
+        .from('households')
+        .select('name')
+        .eq('id', valid.household_id)
+        .single();
+
+      res.json({ invite: { token: valid.token, household_name: household?.name || 'a household' } });
+    } catch (err) {
+      console.error('My-invite error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
   // GET /api/household/invite/:token — look up an invite (for the accept screen).
   // Intentionally unauthenticated: the token IS the credential.
   router.get('/invite/:token', async (req, res) => {

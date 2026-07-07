@@ -33,6 +33,71 @@ const supabase = createClient(
 // ─── Household routes (Pillar 1) ────────────────────────────────────────────
 app.use('/api/household', createHouseholdRouter(supabase, auth));
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Smart-route: if the shipping email names exactly one household member,
+// return that member so the package can be assigned to them.
+function matchRecipientMember(emailText, members) {
+  if (!emailText || !Array.isArray(members) || members.length < 2) return null;
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // Tier 1: greeting / delivery phrases ("Hi Cory," / "delivered to Cory")
+  const anchored = members.filter((m) => {
+    const name = (m.display_name || '').trim();
+    if (name.length < 2) return false;
+    const re = new RegExp(
+      `(?:\\bhi|\\bhello|\\bdear|\\bhey|\\bfor|delivered to|shipped to|addressed to)[,:]?\\s+${esc(name)}\\b`,
+      'i'
+    );
+    return re.test(emailText);
+  });
+  if (anchored.length === 1) return anchored[0];
+
+  // Tier 2: exactly one member's name appears anywhere in the email
+  const mentioned = members.filter((m) => {
+    const name = (m.display_name || '').trim();
+    return name.length >= 2 && new RegExp(`\\b${esc(name)}\\b`, 'i').test(emailText);
+  });
+  return mentioned.length === 1 ? mentioned[0] : null;
+}
+
+// Push a notification to every joined member of a household (or one user).
+// The household-wide delivery alert is the Pillar 1 differentiator: everyone
+// at the address knows, not just the buyer. No-ops until push_tokens exist.
+async function sendHouseholdPush(householdId, fallbackUserId, title, body) {
+  try {
+    let userIds = [];
+    if (householdId) {
+      const { data: members } = await supabase
+        .from('household_members')
+        .select('user_id')
+        .eq('household_id', householdId)
+        .not('user_id', 'is', null);
+      userIds = (members || []).map((m) => m.user_id);
+    } else if (fallbackUserId) {
+      userIds = [fallbackUserId];
+    }
+    if (!userIds.length) return;
+
+    const { data: tokens, error } = await supabase
+      .from('push_tokens')
+      .select('token')
+      .in('user_id', userIds);
+    if (error || !tokens || !tokens.length) return;
+
+    const messages = tokens.map((t) => ({ to: t.token, sound: 'default', title, body }));
+    for (let i = 0; i < messages.length; i += 100) {
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(messages.slice(i, i + 100)),
+      });
+    }
+  } catch (err) {
+    console.warn('Push send failed:', err.message);
+  }
+}
+
 // ─── Health Check ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'On the Way backend is running ✓', timestamp: new Date().toISOString() });
@@ -83,8 +148,25 @@ app.post('/webhook/email', async (req, res) => {
 
     // Resolve the recipient's household so packages land in the shared feed.
     // Default recipient is whoever owns the tracking address that received the
-    // email; smart name-matching against other members can refine this later.
+    // email; smart name-matching against members refines this when the label
+    // names someone else in the household.
     const membership = await getMembership(supabase, user.id);
+    let recipientMemberId = membership ? membership.id : null;
+    if (membership) {
+      try {
+        const { data: members } = await supabase
+          .from('household_members')
+          .select('id, display_name')
+          .eq('household_id', membership.household_id);
+        const matched = matchRecipientMember(`${subject || ''} ${text || ''}`, members || []);
+        if (matched) {
+          recipientMemberId = matched.id;
+          console.log(`Recipient matched by name: ${matched.display_name}`);
+        }
+      } catch (e) {
+        console.warn('Recipient name-match failed:', e.message);
+      }
+    }
 
     // Check if we already have a package with this tracking number for this user
     // to avoid duplicate entries from multiple status update emails
@@ -114,6 +196,16 @@ app.post('/webhook/email', async (req, res) => {
         if (updateError) throw updateError;
         packageRecord = updated;
         console.log(`Updated package ${parsed.tracking_number} for user ${user.id}: ${parsed.status}`);
+
+        // Household-wide alert when the status actually changed.
+        if (parsed.status && parsed.status !== existing.status) {
+          sendHouseholdPush(
+            membership ? membership.household_id : null,
+            user.id,
+            `📦 ${parsed.status}`,
+            `${updated.nickname || updated.merchant || 'A package'}${updated.carrier ? ` · ${updated.carrier}` : ''}`
+          );
+        }
       }
     }
 
@@ -124,7 +216,7 @@ app.post('/webhook/email', async (req, res) => {
         .insert({
           user_id: user.id,
           household_id: membership ? membership.household_id : null,
-          recipient_member_id: membership ? membership.id : null,
+          recipient_member_id: recipientMemberId,
           tracking_number: parsed.tracking_number || null,
           carrier: parsed.carrier,
           status: parsed.status,
@@ -139,6 +231,13 @@ app.post('/webhook/email', async (req, res) => {
       if (insertError) throw insertError;
       packageRecord = newPackage;
       console.log(`Created new package for user ${user.id}: ${parsed.merchant} via ${parsed.carrier}`);
+
+      sendHouseholdPush(
+        membership ? membership.household_id : null,
+        user.id,
+        '📦 New package on the way',
+        `${parsed.merchant || 'A package'}${parsed.carrier ? ` · ${parsed.carrier}` : ''}`
+      );
     }
 
     res.json({ success: true, package: packageRecord });
@@ -311,26 +410,62 @@ app.post('/api/auth/signup', async (req, res) => {
 
     if (profileError) throw profileError;
 
-    // Every new user gets their own household so Pillar 1 works from signup.
-    // The user is the owner; they can invite others later.
+    // Household setup at signup. If an invitation is waiting for this email,
+    // auto-join that household — the invitee never has to type a code.
+    // Otherwise every new user gets their own household (owner role).
+    let joinedExisting = false;
     try {
-      const displayName = email.split('@')[0];
-      const { data: household } = await supabase
-        .from('households')
-        .insert({ name: `${displayName}'s Household` })
-        .select()
-        .single();
-      if (household) {
-        await supabase.from('household_members').insert({
-          household_id: household.id,
-          user_id: authData.user.id,
-          role: 'owner',
-          display_name: displayName,
-        });
+      const { data: invites } = await supabase
+        .from('household_invitations')
+        .select('*')
+        .ilike('email', email.toLowerCase())
+        .is('accepted_at', null);
+      const invite = (invites || []).find((i) => new Date(i.expires_at) > new Date());
+      if (invite) {
+        const { data: pending } = await supabase
+          .from('household_members')
+          .select('id')
+          .eq('household_id', invite.household_id)
+          .is('user_id', null)
+          .ilike('invite_email', invite.email)
+          .maybeSingle();
+        if (pending) {
+          await supabase
+            .from('household_members')
+            .update({ user_id: authData.user.id, invite_email: null, joined_at: new Date().toISOString() })
+            .eq('id', pending.id);
+          await supabase
+            .from('household_invitations')
+            .update({ accepted_at: new Date().toISOString() })
+            .eq('id', invite.id);
+          joinedExisting = true;
+          console.log(`New signup ${email} auto-joined household ${invite.household_id}`);
+        }
       }
-    } catch (hErr) {
-      // Non-fatal: the account exists; a household can be backfilled if this fails.
-      console.error('Household auto-create failed for new user:', hErr.message);
+    } catch (joinErr) {
+      console.error('Invite auto-join failed at signup:', joinErr.message);
+    }
+
+    if (!joinedExisting) {
+      try {
+        const displayName = email.split('@')[0];
+        const { data: household } = await supabase
+          .from('households')
+          .insert({ name: `${displayName}'s Household` })
+          .select()
+          .single();
+        if (household) {
+          await supabase.from('household_members').insert({
+            household_id: household.id,
+            user_id: authData.user.id,
+            role: 'owner',
+            display_name: displayName,
+          });
+        }
+      } catch (hErr) {
+        // Non-fatal: the account exists; a household can be backfilled if this fails.
+        console.error('Household auto-create failed for new user:', hErr.message);
+      }
     }
 
     res.json({
@@ -362,6 +497,168 @@ app.get('/api/auth/profile', auth.authMiddleware, async (req, res) => {
 
   } catch (err) {
     console.error('Profile error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/auth/account — permanent account deletion (Play Store requirement).
+// Removes packages, household membership (with ownership handoff), profile row,
+// and the Supabase auth user.
+app.delete('/api/auth/account', auth.authMiddleware, async (req, res) => {
+  try {
+    const userId = auth.getUserId(req);
+
+    const membership = await getMembership(supabase, userId);
+    if (membership) {
+      const { data: others } = await supabase
+        .from('household_members')
+        .select('id, role, joined_at, user_id')
+        .eq('household_id', membership.household_id)
+        .neq('id', membership.id);
+      const rest = others || [];
+      const joinedRest = rest.filter((m) => m.user_id);
+
+      if (membership.role === 'owner' && joinedRest.length) {
+        // Promote the longest-tenured joined member so the household survives.
+        const heir = joinedRest.sort((a, b) => new Date(a.joined_at) - new Date(b.joined_at))[0];
+        await supabase.from('household_members').update({ role: 'owner' }).eq('id', heir.id);
+      }
+
+      await supabase.from('household_members').delete().eq('id', membership.id);
+
+      if (!rest.length) {
+        // Nobody left (not even pending invitees) — dissolve the household.
+        // Clear package FKs first so the household row can be removed.
+        await supabase
+          .from('packages')
+          .update({ household_id: null, recipient_member_id: null })
+          .eq('household_id', membership.household_id);
+        await supabase.from('households').delete().eq('id', membership.household_id);
+      }
+    }
+
+    await supabase.from('packages').delete().eq('user_id', userId);
+    await supabase.from('push_tokens').delete().eq('user_id', userId); // ignore result; table may not exist yet
+    await supabase.from('users').delete().eq('id', userId);
+
+    const { error: adminErr } = await supabase.auth.admin.deleteUser(userId);
+    if (adminErr) throw adminErr;
+
+    console.log(`Account deleted: ${userId}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Account deletion error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/push/register — store an Expo push token for the caller.
+app.post('/api/push/register', auth.authMiddleware, async (req, res) => {
+  try {
+    const userId = auth.getUserId(req);
+    const { token, platform } = req.body;
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ error: 'token required' });
+    }
+    const { error } = await supabase.from('push_tokens').upsert(
+      { user_id: userId, token, platform: platform || 'android', updated_at: new Date().toISOString() },
+      { onConflict: 'token' }
+    );
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Push register error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/refresh-status — live-status refresh via EasyPost (task #49).
+// No-ops (enabled:false) until EASYPOST_API_KEY is set on Railway; the mobile
+// pull-to-refresh already calls this, so setting the key lights it up.
+const EASYPOST_STATUS_MAP = {
+  pre_transit: 'Label Created',
+  in_transit: 'In Transit',
+  out_for_delivery: 'Out for Delivery',
+  delivered: 'Delivered',
+  available_for_pickup: 'Available for Pickup',
+  return_to_sender: 'Delayed',
+  failure: 'Delayed',
+  error: 'Delayed',
+};
+
+app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
+  try {
+    const apiKey = process.env.EASYPOST_API_KEY;
+    if (!apiKey) return res.json({ refreshed: 0, enabled: false });
+
+    const userId = auth.getUserId(req);
+    const membership = await getMembership(supabase, userId);
+
+    let query = supabase
+      .from('packages')
+      .select('id, tracking_number, carrier, status, estimated_delivery, nickname, merchant')
+      .eq('archived', false)
+      .eq('deleted', false)
+      .not('tracking_number', 'is', null);
+    query = membership
+      ? query.eq('household_id', membership.household_id)
+      : query.eq('user_id', userId);
+    const { data: pkgs, error } = await query;
+    if (error) throw error;
+
+    const authHeader = 'Basic ' + Buffer.from(`${apiKey}:`).toString('base64');
+    let refreshed = 0;
+
+    for (const pkg of (pkgs || []).slice(0, 30)) {
+      try {
+        // Registering a tracker is idempotent-ish: on duplicate, fall back to lookup.
+        let tracker = null;
+        const createResp = await fetch('https://api.easypost.com/v2/trackers', {
+          method: 'POST',
+          headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tracker: { tracking_code: pkg.tracking_number } }),
+        });
+        if (createResp.ok) {
+          tracker = await createResp.json();
+        } else {
+          const listResp = await fetch(
+            `https://api.easypost.com/v2/trackers?tracking_code=${encodeURIComponent(pkg.tracking_number)}`,
+            { headers: { Authorization: authHeader } }
+          );
+          if (listResp.ok) {
+            const list = await listResp.json();
+            tracker = (list.trackers || [])[0] || null;
+          }
+        }
+        if (!tracker) continue;
+
+        const newStatus = EASYPOST_STATUS_MAP[tracker.status] || null;
+        const newEta = tracker.est_delivery_date ? String(tracker.est_delivery_date).slice(0, 10) : null;
+        const updates = {};
+        if (newStatus && newStatus !== pkg.status) updates.status = newStatus;
+        if (newEta && newEta !== pkg.estimated_delivery) updates.estimated_delivery = newEta;
+
+        if (Object.keys(updates).length) {
+          updates.last_updated = new Date().toISOString();
+          await supabase.from('packages').update(updates).eq('id', pkg.id);
+          refreshed++;
+          if (updates.status) {
+            sendHouseholdPush(
+              membership ? membership.household_id : null,
+              userId,
+              `📦 ${updates.status}`,
+              `${pkg.nickname || pkg.merchant || pkg.tracking_number}${pkg.carrier ? ` · ${pkg.carrier}` : ''}`
+            );
+          }
+        }
+      } catch (e) {
+        console.warn(`EasyPost refresh failed for ${pkg.tracking_number}:`, e.message);
+      }
+    }
+
+    res.json({ refreshed, enabled: true });
+  } catch (err) {
+    console.error('Refresh status error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
