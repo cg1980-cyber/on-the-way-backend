@@ -572,6 +572,32 @@ app.post('/api/push/register', auth.authMiddleware, async (req, res) => {
   }
 });
 
+// POST /api/push/test — send a test notification to the caller's household.
+// Lets users (and us) verify the FCM pipeline end-to-end from Settings.
+app.post('/api/push/test', auth.authMiddleware, async (req, res) => {
+  try {
+    const userId = auth.getUserId(req);
+    const { data: tokens } = await supabase
+      .from('push_tokens')
+      .select('token')
+      .eq('user_id', userId);
+    if (!tokens || !tokens.length) {
+      return res.json({ sent: false, reason: 'No device registered yet — open the app once with notifications allowed.' });
+    }
+    const membership = await getMembership(supabase, userId);
+    await sendHouseholdPush(
+      membership ? membership.household_id : null,
+      userId,
+      '🔔 Test notification',
+      'Push is working — On the Way'
+    );
+    res.json({ sent: true });
+  } catch (err) {
+    console.error('Push test error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // POST /api/refresh-status — live-status refresh via EasyPost (task #49).
 // No-ops (enabled:false) until EASYPOST_API_KEY is set on Railway; the mobile
 // pull-to-refresh already calls this, so setting the key lights it up.
