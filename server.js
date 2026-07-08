@@ -23,6 +23,10 @@ try {
 
       // Apply rate limiting
       app.use('/api/', auth.apiLimiter);
+      // Webhook ingest is secret-protected but was previously unthrottled.
+      // 50 req/15min is generous for beta-scale email volume; revisit the
+      // per-IP keying before real scale (Cloudflare egress IPs are shared).
+      app.use('/webhook/', auth.webhookLimiter);
 
 // ─── Supabase Client ────────────────────────────────────────────────────────
 const supabase = createClient(
