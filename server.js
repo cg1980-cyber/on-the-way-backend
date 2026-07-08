@@ -179,20 +179,25 @@ app.post('/webhook/email', async (req, res) => {
     if (parsed.tracking_number) {
       const { data: existing } = await supabase
         .from('packages')
-        .select('id, status')
+        .select('id, status, delivered_at')
         .eq('user_id', user.id)
         .eq('tracking_number', parsed.tracking_number)
         .single();
 
       if (existing) {
-        // Update the existing package's status
+        // Update the existing package's status. A "Delivered" carrier email
+        // arrives on delivery day, so today is the actual delivery date.
+        const statusUpdate = {
+          status: parsed.status,
+          estimated_delivery: parsed.estimated_delivery,
+          last_updated: new Date().toISOString(),
+        };
+        if (parsed.status === 'Delivered' && !existing.delivered_at) {
+          statusUpdate.delivered_at = new Date().toISOString().slice(0, 10);
+        }
         const { data: updated, error: updateError } = await supabase
           .from('packages')
-          .update({
-            status: parsed.status,
-            estimated_delivery: parsed.estimated_delivery,
-            last_updated: new Date().toISOString(),
-          })
+          .update(statusUpdate)
           .eq('id', existing.id)
           .select()
           .single();
@@ -226,6 +231,7 @@ app.post('/webhook/email', async (req, res) => {
           status: parsed.status,
           merchant: parsed.merchant,
           estimated_delivery: parsed.estimated_delivery,
+          delivered_at: parsed.status === 'Delivered' ? new Date().toISOString().slice(0, 10) : null,
           nickname: null,  // User can set this in the app
           last_updated: new Date().toISOString(),
         })
@@ -626,7 +632,7 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
 
     let query = supabase
       .from('packages')
-      .select('id, tracking_number, carrier, status, estimated_delivery, nickname, merchant')
+      .select('id, tracking_number, carrier, status, estimated_delivery, delivered_at, nickname, merchant')
       .eq('archived', false)
       .eq('deleted', false)
       .not('tracking_number', 'is', null);
@@ -682,6 +688,19 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
         const updates = {};
         if (newStatus && newStatus !== pkg.status) updates.status = newStatus;
         if (newEta && newEta !== pkg.estimated_delivery) updates.estimated_delivery = newEta;
+
+        // Actual delivery date: EasyPost's tracking timeline has the real
+        // delivered scan, which can be days before we happen to refresh.
+        if (tracker.status === 'delivered' && !pkg.delivered_at) {
+          const details = Array.isArray(tracker.tracking_details) ? tracker.tracking_details : [];
+          const deliveredScan = [...details].reverse().find(
+            (d) => (d.status || '').toLowerCase() === 'delivered'
+          );
+          const deliveredAt = deliveredScan && deliveredScan.datetime
+            ? String(deliveredScan.datetime).slice(0, 10)
+            : new Date().toISOString().slice(0, 10);
+          updates.delivered_at = deliveredAt;
+        }
 
         if (Object.keys(updates).length) {
           updates.last_updated = new Date().toISOString();
