@@ -638,8 +638,10 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
 
     const authHeader = 'Basic ' + Buffer.from(`${apiKey}:`).toString('base64');
     let refreshed = 0;
+    const diagnostics = [];
 
     for (const pkg of (pkgs || []).slice(0, 30)) {
+      const diag = { tracking_number: pkg.tracking_number, current_status: pkg.status };
       try {
         // Registering a tracker is idempotent-ish: on duplicate, fall back to lookup.
         let tracker = null;
@@ -651,6 +653,9 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
         if (createResp.ok) {
           tracker = await createResp.json();
         } else {
+          const createErrBody = await createResp.text().catch(() => '');
+          diag.create_error = `${createResp.status}: ${createErrBody.slice(0, 200)}`;
+
           const listResp = await fetch(
             `https://api.easypost.com/v2/trackers?tracking_code=${encodeURIComponent(pkg.tracking_number)}`,
             { headers: { Authorization: authHeader } }
@@ -658,9 +663,19 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
           if (listResp.ok) {
             const list = await listResp.json();
             tracker = (list.trackers || [])[0] || null;
+          } else {
+            const listErrBody = await listResp.text().catch(() => '');
+            diag.list_error = `${listResp.status}: ${listErrBody.slice(0, 200)}`;
           }
         }
-        if (!tracker) continue;
+        if (!tracker) {
+          diag.result = 'no_tracker_returned';
+          diagnostics.push(diag);
+          continue;
+        }
+
+        diag.easypost_status = tracker.status;
+        diag.easypost_est_delivery = tracker.est_delivery_date || null;
 
         const newStatus = EASYPOST_STATUS_MAP[tracker.status] || null;
         const newEta = tracker.est_delivery_date ? String(tracker.est_delivery_date).slice(0, 10) : null;
@@ -672,6 +687,8 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
           updates.last_updated = new Date().toISOString();
           await supabase.from('packages').update(updates).eq('id', pkg.id);
           refreshed++;
+          diag.result = 'updated';
+          diag.new_status = updates.status || null;
           if (updates.status) {
             sendHouseholdPush(
               membership ? membership.household_id : null,
@@ -680,13 +697,21 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
               `${pkg.nickname || pkg.merchant || pkg.tracking_number}${pkg.carrier ? ` · ${pkg.carrier}` : ''}`
             );
           }
+        } else if (!newStatus) {
+          diag.result = `unmapped_easypost_status:${tracker.status}`;
+        } else {
+          diag.result = 'no_change_needed';
         }
       } catch (e) {
+        diag.result = 'exception';
+        diag.error = e.message;
         console.warn(`EasyPost refresh failed for ${pkg.tracking_number}:`, e.message);
       }
+      diagnostics.push(diag);
     }
 
-    res.json({ refreshed, enabled: true });
+    console.log('EasyPost refresh diagnostics:', JSON.stringify(diagnostics));
+    res.json({ refreshed, enabled: true, checked: diagnostics.length, diagnostics });
   } catch (err) {
     console.error('Refresh status error:', err);
     res.status(500).json({ error: 'Internal server error' });
