@@ -42,6 +42,7 @@ async function sendInviteEmail({ toEmail, inviterName, householdName, token, cod
   const apiKey = process.env.BREVO_API_KEY;
   const acceptUrl =
     `https://cg1980-cyber.github.io/on-the-way-mobile/invite.html?token=${token}`;
+  const downloadUrl = 'https://cg1980-cyber.github.io/on-the-way-mobile/download.html';
 
   if (!apiKey) {
     console.warn('BREVO_API_KEY not set — invite created but email not sent.');
@@ -65,11 +66,17 @@ async function sendInviteEmail({ toEmail, inviterName, householdName, token, cod
           <h2 style="color:#10b981;">You're invited to ${householdName}</h2>
           <p>${inviterName} wants you to join their household on <strong>On the Way</strong> —
              so you can both see every package coming to your home in one shared feed.</p>
-          <p style="font-size:15px;">To join:</p>
+          <p style="margin:24px 0;text-align:center;">
+            <a href="${downloadUrl}"
+               style="display:inline-block;background:#10b981;color:#fff;padding:14px 28px;
+                      border-radius:10px;text-decoration:none;font-weight:600;font-size:16px;">
+              Download the app (Android)
+            </a>
+          </p>
+          <p style="font-size:15px;">Then:</p>
           <ol style="font-size:15px;color:#334155;line-height:1.6;">
-            <li>Install <strong>On the Way</strong> and sign up using <strong>${toEmail}</strong></li>
-            <li>Go to <strong>Settings → Household → Have an invite code?</strong></li>
-            <li>Enter this code:</li>
+            <li>Sign up using <strong>${toEmail}</strong> (the address this invite was sent to) — you'll join the household automatically.</li>
+            <li>If it doesn't join on its own, go to <strong>Settings → Household → Have an invite code?</strong> and enter this code:</li>
           </ol>
           <p style="text-align:center;margin:24px 0;">
             <span style="display:inline-block;background:#0f172a;color:#10b981;font-size:30px;
@@ -77,7 +84,7 @@ async function sendInviteEmail({ toEmail, inviterName, householdName, token, cod
                          font-family:monospace;">${code}</span>
           </p>
           <p style="color:#64748b;font-size:13px;">
-            Or open this link for instructions: <a href="${acceptUrl}">${acceptUrl}</a><br/>
+            Install help and instructions: <a href="${downloadUrl}">${downloadUrl}</a><br/>
             This invite expires in 7 days.
           </p>
         </div>`,
