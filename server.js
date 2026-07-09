@@ -630,6 +630,19 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
     const userId = auth.getUserId(req);
     const membership = await getMembership(supabase, userId);
 
+    // Beta cost control: EasyPost charges per registered tracker, and the
+    // account owner personally pays. Live refresh is limited to allowlisted
+    // households (EASYPOST_ALLOWED_HOUSEHOLDS, comma-separated ids on
+    // Railway). Everyone else still gets free automatic status updates via
+    // carrier emails, plus the tap-the-tracking-number link.
+    const allowedHouseholds = (process.env.EASYPOST_ALLOWED_HOUSEHOLDS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!membership || !allowedHouseholds.includes(membership.household_id)) {
+      return res.json({ refreshed: 0, enabled: false, gated: true });
+    }
+
     let query = supabase
       .from('packages')
       .select('id, tracking_number, carrier, status, estimated_delivery, delivered_at, nickname, merchant')
