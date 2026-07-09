@@ -632,10 +632,13 @@ app.post('/api/refresh-status', auth.authMiddleware, async (req, res) => {
 
     // Beta cost control: EasyPost charges per registered tracker, and the
     // account owner personally pays. Live refresh is limited to allowlisted
-    // households (EASYPOST_ALLOWED_HOUSEHOLDS, comma-separated ids on
-    // Railway). Everyone else still gets free automatic status updates via
-    // carrier emails, plus the tap-the-tracking-number link.
-    const allowedHouseholds = (process.env.EASYPOST_ALLOWED_HOUSEHOLDS || '')
+    // households. Default: the owner's household; override or extend with
+    // EASYPOST_ALLOWED_HOUSEHOLDS (comma-separated ids on Railway). Everyone
+    // else still gets free automatic status updates via carrier emails, plus
+    // the tap-the-tracking-number link. (A household id is an identifier,
+    // not a credential — it grants nothing without a member's JWT.)
+    const DEFAULT_ALLOWED_HOUSEHOLDS = 'a60a1695-abb5-4d70-b3d8-b7385cd1e1cd';
+    const allowedHouseholds = (process.env.EASYPOST_ALLOWED_HOUSEHOLDS || DEFAULT_ALLOWED_HOUSEHOLDS)
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
