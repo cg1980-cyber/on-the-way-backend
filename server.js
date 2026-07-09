@@ -423,65 +423,85 @@ app.post('/api/auth/signup', async (req, res) => {
     // Household setup at signup. If an invitation is waiting for this email,
     // auto-join that household — the invitee never has to type a code.
     // Otherwise every new user gets their own household (owner role).
-    let joinedExisting = false;
+    // Every DB result is checked explicitly (supabase-js returns errors, it
+    // does not throw) and the outcome is reported in the response so a
+    // failure here is visible instead of silent.
+    let householdSetup = 'none';
     try {
-      const { data: invites } = await supabase
+      const { data: invites, error: invErr } = await supabase
         .from('household_invitations')
         .select('*')
         .ilike('email', email.toLowerCase())
         .is('accepted_at', null);
+      if (invErr) throw new Error(`invite lookup: ${invErr.message}`);
+
       const invite = (invites || []).find((i) => new Date(i.expires_at) > new Date());
       if (invite) {
-        const { data: pending } = await supabase
+        const { data: pending, error: pendErr } = await supabase
           .from('household_members')
           .select('id')
           .eq('household_id', invite.household_id)
           .is('user_id', null)
           .ilike('invite_email', invite.email)
           .maybeSingle();
+        if (pendErr) throw new Error(`pending lookup: ${pendErr.message}`);
+
         if (pending) {
-          await supabase
+          const { error: linkErr } = await supabase
             .from('household_members')
             .update({ user_id: authData.user.id, invite_email: null, joined_at: new Date().toISOString() })
             .eq('id', pending.id);
-          await supabase
+          if (linkErr) throw new Error(`member link: ${linkErr.message}`);
+
+          const { error: acceptErr } = await supabase
             .from('household_invitations')
             .update({ accepted_at: new Date().toISOString() })
             .eq('id', invite.id);
-          joinedExisting = true;
+          if (acceptErr) console.warn('Invite accepted_at update failed:', acceptErr.message);
+
+          householdSetup = 'joined';
           console.log(`New signup ${email} auto-joined household ${invite.household_id}`);
         }
       }
     } catch (joinErr) {
+      householdSetup = `join-failed: ${joinErr.message}`;
       console.error('Invite auto-join failed at signup:', joinErr.message);
     }
 
-    if (!joinedExisting) {
+    if (householdSetup !== 'joined') {
       try {
         const displayName = email.split('@')[0];
-        const { data: household } = await supabase
+        const { data: household, error: hhErr } = await supabase
           .from('households')
           .insert({ name: `${displayName}'s Household` })
           .select()
           .single();
-        if (household) {
-          await supabase.from('household_members').insert({
-            household_id: household.id,
-            user_id: authData.user.id,
-            role: 'owner',
-            display_name: displayName,
-          });
-        }
+        if (hhErr) throw new Error(`household insert: ${hhErr.message}`);
+
+        const { error: memErr } = await supabase.from('household_members').insert({
+          household_id: household.id,
+          user_id: authData.user.id,
+          role: 'owner',
+          display_name: displayName,
+        });
+        if (memErr) throw new Error(`member insert: ${memErr.message}`);
+
+        householdSetup = householdSetup.startsWith('join-failed')
+          ? `${householdSetup}; created-fallback`
+          : 'created';
       } catch (hErr) {
         // Non-fatal: the account exists; a household can be backfilled if this fails.
+        householdSetup = `${householdSetup}; create-failed: ${hErr.message}`;
         console.error('Household auto-create failed for new user:', hErr.message);
       }
     }
 
+    console.log(`Signup household setup for ${email}: ${householdSetup}`);
     res.json({
       success: true,
       user: userProfile,
       trackingEmail,
+      household_setup: householdSetup,
     });
 
   } catch (err) {
