@@ -128,6 +128,17 @@ app.get('/debug/keyrole', (req, res) => {
   res.json(info);
 });
 
+// TEMP: report the Postgres role the backend actually operates as.
+app.get('/debug/dbrole', async (req, res) => {
+  try {
+    const { data, error } = await supabase.rpc('debug_whoami');
+    if (error) return res.json({ ok: false, error: error.message });
+    res.json({ ok: true, db_role: data });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
 // ─── Email Webhook ──────────────────────────────────────────────────────────
 // Cloudflare Worker will POST to this endpoint when an email arrives
 // Expected body: { to, from, subject, text, html }
