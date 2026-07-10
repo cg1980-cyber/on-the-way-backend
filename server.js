@@ -113,37 +113,6 @@ app.get('/', (req, res) => {
   res.json({ status: 'On the Way backend is running ✓', timestamp: new Date().toISOString() });
 });
 
-// ─── TEMP diagnostic: what kind of Supabase key is loaded? ───────────────────
-// Reports only the JWT role claim / key format — never the key itself. Used to
-// confirm SUPABASE_SERVICE_KEY is the service_role key, not anon. Remove after.
-app.get('/debug/keyrole', (req, res) => {
-  const k = process.env.SUPABASE_SERVICE_KEY || '';
-  const info = { present: !!k, length: k.length };
-  if (k.startsWith('sb_secret_')) info.format = 'new-secret-key';
-  else if (k.startsWith('sb_publishable_')) info.format = 'new-publishable-key';
-  else if (k.split('.').length === 3) {
-    info.format = 'legacy-jwt';
-    try {
-      const payload = JSON.parse(Buffer.from(k.split('.')[1], 'base64').toString('utf8'));
-      info.role = payload.role || 'no-role-claim';
-      info.ref = payload.ref;
-    } catch (e) { info.role = 'decode-failed'; }
-  } else {
-    info.format = 'unknown';
-  }
-  res.json(info);
-});
-
-// TEMP: report the Postgres role the backend actually operates as.
-app.get('/debug/dbrole', async (req, res) => {
-  try {
-    const { data, error } = await supabase.rpc('debug_whoami');
-    if (error) return res.json({ ok: false, error: error.message });
-    res.json({ ok: true, db_role: data });
-  } catch (e) {
-    res.json({ ok: false, error: e.message });
-  }
-});
 
 // ─── Email Webhook ──────────────────────────────────────────────────────────
 // Cloudflare Worker will POST to this endpoint when an email arrives
