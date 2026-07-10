@@ -29,9 +29,15 @@ try {
       app.use('/webhook/', auth.webhookLimiter);
 
 // ─── Supabase Client ────────────────────────────────────────────────────────
+// Service key bypasses RLS for server-side writes. The auth options are
+// load-bearing: without them, calling any auth method that returns a session
+// (e.g. auth.signUp) makes this SHARED client adopt that user's session and
+// silently lose service-role powers for every subsequent query until the
+// process restarts. (Root cause of the 2026-07-09 signup/household outage.)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY  // Service key bypasses RLS for server-side writes
+  process.env.SUPABASE_SERVICE_KEY,
+  { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } }
 );
 
 // ─── Household routes (Pillar 1) ────────────────────────────────────────────
@@ -425,10 +431,14 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    // Sign up with Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.signUp({
+    // Create the user via the ADMIN API — never auth.signUp() here. signUp
+    // returns a session that the shared service client would adopt, degrading
+    // it to end-user permissions for every later request (see client options
+    // above). admin.createUser touches no client session state.
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
       email,
       password,
+      email_confirm: true,
     });
 
     if (authError) throw authError;
