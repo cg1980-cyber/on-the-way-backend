@@ -446,18 +446,39 @@ app.get('/api/emails', auth.authMiddleware, async (req, res) => {
   }
 });
 
+// Decode quoted-printable email bodies (soft line breaks like "=\n" and hex
+// escapes like "=20"/"=3D") into readable text/HTML. Forwarded emails often
+// arrive still wire-encoded; without this the app shows "=20" soup.
+function decodeQuotedPrintable(input) {
+  if (!input || !/=(\r?\n|[0-9A-Fa-f]{2})/.test(input)) return input;
+  const cleaned = String(input).replace(/=\r?\n/g, '');
+  const bytes = [];
+  for (let i = 0; i < cleaned.length; i++) {
+    const c = cleaned[i];
+    if (c === '=' && /^[0-9A-Fa-f]{2}$/.test(cleaned.substr(i + 1, 2))) {
+      bytes.push(parseInt(cleaned.substr(i + 1, 2), 16));
+      i += 2;
+    } else {
+      for (const b of Buffer.from(c, 'utf8')) bytes.push(b);
+    }
+  }
+  try { return Buffer.from(bytes).toString('utf8'); } catch (e) { return input; }
+}
+
 // GET /api/emails/:id — one email with its text body (own emails only)
 app.get('/api/emails/:id', auth.authMiddleware, async (req, res) => {
   try {
     const userId = auth.getUserId(req);
     const { data, error } = await supabase
       .from('received_emails')
-      .select('id, from_addr, subject, received_at, is_shipping, package_id, text_body')
+      .select('id, from_addr, subject, received_at, is_shipping, package_id, text_body, html_body')
       .eq('id', req.params.id)
       .eq('user_id', userId)
       .maybeSingle();
     if (error) throw new Error(error.message);
     if (!data) return res.status(404).json({ error: 'Email not found' });
+    data.text_body = decodeQuotedPrintable(data.text_body);
+    data.html_body = decodeQuotedPrintable(data.html_body);
     res.json(data);
   } catch (err) {
     console.error('Get email error:', err.message);
@@ -490,13 +511,15 @@ app.post('/api/emails/:id/forward', auth.authMiddleware, async (req, res) => {
     const apiKey = process.env.BREVO_API_KEY;
     if (!apiKey) return res.status(503).json({ error: 'Email sending is not configured' });
 
+    const htmlBody = decodeQuotedPrintable(mail.html_body);
+    const textBody = decodeQuotedPrintable(mail.text_body);
     const header =
       `<p style="color:#64748b;font-size:13px;border-bottom:1px solid #e2e8f0;padding-bottom:8px;">` +
       `Forwarded from your On the Way tracking inbox — originally from ` +
       `<strong>${mail.from_addr}</strong> on ${new Date(mail.received_at).toLocaleString()}</p>`;
-    const bodyHtml = mail.html_body
-      ? header + mail.html_body
-      : header + `<pre style="white-space:pre-wrap;font-family:inherit;">${(mail.text_body || '')
+    const bodyHtml = htmlBody
+      ? header + htmlBody
+      : header + `<pre style="white-space:pre-wrap;font-family:inherit;">${(textBody || '')
           .replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre>`;
 
     const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
