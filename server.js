@@ -275,17 +275,24 @@ app.post('/webhook/email', async (req, res) => {
       }
     }
 
-    // Check if we already have a package with this tracking number for this user
-    // to avoid duplicate entries from multiple status update emails
+    // Check if this tracking number already exists — HOUSEHOLD-WIDE, not just
+    // for this user. Two members getting emails about the same physical
+    // package must converge on one row (a per-user check created invisible
+    // twins that the app then had to dedupe away).
     let packageRecord;
 
     if (parsed.tracking_number) {
-      const { data: existing } = await supabase
+      let existQuery = supabase
         .from('packages')
         .select('id, status, delivered_at')
-        .eq('user_id', user.id)
-        .eq('tracking_number', parsed.tracking_number)
-        .single();
+        .eq('tracking_number', parsed.tracking_number);
+      existQuery = membership
+        ? existQuery.eq('household_id', membership.household_id)
+        : existQuery.eq('user_id', user.id);
+      const { data: existingRows } = await existQuery
+        .order('last_updated', { ascending: false })
+        .limit(1);
+      const existing = existingRows && existingRows[0];
 
       if (existing) {
         // Update the existing package's status. A "Delivered" carrier email
