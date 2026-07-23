@@ -109,6 +109,29 @@ async function sendHouseholdPush(householdId, fallbackUserId, title, body) {
   }
 }
 
+// Send an email via Brevo's transactional API (shared by auto-forward and the
+// manual forward endpoint).
+async function sendViaBrevo({ toEmail, subject, html, senderName = 'On the Way', extraHeaders }) {
+  const apiKey = process.env.BREVO_API_KEY;
+  if (!apiKey) throw new Error('Email sending is not configured');
+  const payload = {
+    sender: { name: senderName, email: 'support@onthewayapp.net' },
+    to: [{ email: toEmail }],
+    subject: subject || '(no subject)',
+    htmlContent: html,
+  };
+  if (extraHeaders) payload.headers = extraHeaders;
+  const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': apiKey, 'Content-Type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '');
+    throw new Error(`Brevo send failed (${resp.status}): ${detail.slice(0, 200)}`);
+  }
+}
+
 // Store a copy of an email received at a user's tracking address so they can
 // view it in-app (Tracking Inbox). Fully guarded: storage failure must never
 // break package ingestion (also makes deploys independent of the table's
@@ -165,6 +188,13 @@ app.post('/webhook/email', async (req, res) => {
     if (req.body.raw_base64) {
       try {
         const parsedMail = await simpleParser(Buffer.from(req.body.raw_base64, 'base64'));
+        // Loop guard: this header marks copies WE sent. If one circles back
+        // (e.g. a personal inbox auto-forwarding to the tracking address),
+        // drop it before it becomes a duplicate package or another forward.
+        if (parsedMail.headers && parsedMail.headers.get('x-otw-forwarded')) {
+          console.log(`Loop guard: dropping our own forwarded copy addressed to ${to}`);
+          return res.status(200).json({ message: 'Own forwarded copy, ignoring' });
+        }
         subject = parsedMail.subject || subject || '';
         text = parsedMail.text || text || '';
         html = (typeof parsedMail.html === 'string' && parsedMail.html)
@@ -186,6 +216,25 @@ app.post('/webhook/email', async (req, res) => {
     if (userError || !user) {
       console.log(`No user found for email address: ${to}`);
       return res.status(200).json({ message: 'No matching user, ignoring' });
+    }
+
+    // Auto-forward: every email received at the tracking address is copied to
+    // the user's personal (account) email — registering carriers with the
+    // tracking address never costs them their notifications. Skipped when the
+    // user sent it themselves (they already have it), which also breaks any
+    // personal-inbox forwarding loop at the first hop.
+    const fromSelf = user.email && String(from).toLowerCase().includes(user.email.toLowerCase());
+    if (!fromSelf && user.email) {
+      const copyHtml = (typeof html === 'string' && html.trim())
+        ? html
+        : `<pre style="white-space:pre-wrap;font-family:inherit;">${String(text || '')
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre>`;
+      sendViaBrevo({
+        toEmail: user.email,
+        subject: subject || '(no subject)',
+        html: copyHtml,
+        extraHeaders: { 'X-OTW-Forwarded': '1' },
+      }).catch((e) => console.warn('Auto-forward failed:', e.message));
     }
 
     // Parse the carrier email to extract package info
@@ -505,18 +554,27 @@ app.get('/api/emails/:id', auth.authMiddleware, async (req, res) => {
   }
 });
 
-// POST /api/emails/:id/forward — forward the stored email to the caller's OWN
-// account email. Recipient is never caller-supplied (no spam-relay surface).
+// POST /api/emails/:id/forward — forward the stored email. Defaults to the
+// caller's own account email; an optional `to` in the body sends it to a
+// recipient of their choice for that one email. Choice-recipient forwards are
+// attributed to the sender's account in the message body (abuse stays
+// accountable), and the endpoint sits behind auth + rate limiting.
 app.post('/api/emails/:id/forward', auth.authMiddleware, async (req, res) => {
   try {
     const userId = auth.getUserId(req);
 
-    let toEmail = (req.user.email || '').trim();
-    if (!toEmail) {
+    let accountEmail = (req.user.email || '').trim();
+    if (!accountEmail) {
       const { data: profile } = await supabase.from('users').select('email').eq('id', userId).maybeSingle();
-      toEmail = profile && profile.email ? profile.email : '';
+      accountEmail = profile && profile.email ? profile.email : '';
     }
-    if (!toEmail) return res.status(400).json({ error: 'No account email on file' });
+
+    const requestedTo = (req.body && typeof req.body.to === 'string') ? req.body.to.trim().toLowerCase() : '';
+    if (requestedTo && (requestedTo.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(requestedTo))) {
+      return res.status(400).json({ error: 'Invalid recipient email address' });
+    }
+    const toEmail = requestedTo || accountEmail;
+    if (!toEmail) return res.status(400).json({ error: 'No recipient available' });
 
     const { data: mail, error } = await supabase
       .from('received_emails')
@@ -527,34 +585,26 @@ app.post('/api/emails/:id/forward', auth.authMiddleware, async (req, res) => {
     if (error) throw new Error(error.message);
     if (!mail) return res.status(404).json({ error: 'Email not found' });
 
-    const apiKey = process.env.BREVO_API_KEY;
-    if (!apiKey) return res.status(503).json({ error: 'Email sending is not configured' });
-
     const htmlBody = decodeQuotedPrintable(mail.html_body);
     const textBody = decodeQuotedPrintable(mail.text_body);
+    const attribution = requestedTo && requestedTo !== accountEmail.toLowerCase()
+      ? ` by ${accountEmail}`
+      : '';
     const header =
       `<p style="color:#64748b;font-size:13px;border-bottom:1px solid #e2e8f0;padding-bottom:8px;">` +
-      `Forwarded from your On the Way tracking inbox — originally from ` +
+      `Forwarded from an On the Way tracking inbox${attribution} — originally from ` +
       `<strong>${mail.from_addr}</strong> on ${new Date(mail.received_at).toLocaleString()}</p>`;
     const bodyHtml = htmlBody
       ? header + htmlBody
       : header + `<pre style="white-space:pre-wrap;font-family:inherit;">${(textBody || '')
           .replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre>`;
 
-    const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: { 'api-key': apiKey, 'Content-Type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({
-        sender: { name: 'On the Way', email: 'support@onthewayapp.net' },
-        to: [{ email: toEmail }],
-        subject: `Fwd: ${mail.subject || '(no subject)'}`,
-        htmlContent: bodyHtml,
-      }),
+    await sendViaBrevo({
+      toEmail,
+      subject: `Fwd: ${mail.subject || '(no subject)'}`,
+      html: bodyHtml,
+      extraHeaders: { 'X-OTW-Forwarded': '1' },
     });
-    if (!resp.ok) {
-      const detail = await resp.text().catch(() => '');
-      throw new Error(`Brevo send failed (${resp.status}): ${detail.slice(0, 200)}`);
-    }
 
     res.json({ success: true, forwarded_to: toEmail });
   } catch (err) {
