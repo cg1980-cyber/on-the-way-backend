@@ -197,17 +197,25 @@ const rateLimit = require('express-rate-limit');
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 300,
   message: 'Too many API requests',
   standardHeaders: true,
   legacyHeaders: false,
+  // Key by bearer token when present so each signed-in DEVICE gets its own
+  // bucket. Keying purely by IP made household members on the same Wi-Fi
+  // share one limit (every app open fires several calls — two phones testing
+  // together hit 429 fast). Unauthenticated requests still bucket by IP.
   keyGenerator: (req) => {
+    const authHeader = req.headers.authorization;
+    if (authHeader && typeof authHeader === 'string') {
+      return 'tok:' + crypto.createHash('sha256').update(authHeader).digest('hex').slice(0, 32);
+    }
     const forwarded = req.headers['x-forwarded-for'];
     if (forwarded) {
       const ips = typeof forwarded === 'string' ? forwarded.split(',') : forwarded;
-      return Array.isArray(ips) ? ips[0].trim() : ips;
+      return 'ip:' + (Array.isArray(ips) ? ips[0].trim() : ips);
     }
-    return req.ip || (req.connection && req.connection.remoteAddress);
+    return 'ip:' + (req.ip || (req.connection && req.connection.remoteAddress));
   },
 });
 
