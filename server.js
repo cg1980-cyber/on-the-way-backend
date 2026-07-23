@@ -6,6 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { parseCarrierEmail } = require('./emailParser');
+const { simpleParser } = require('mailparser');
 const auth = require('./auth');
 const { createHouseholdRouter, getMembership } = require('./household');
 
@@ -144,7 +145,7 @@ app.get('/', (req, res) => {
 // Expected body: { to, from, subject, text, html }
 app.post('/webhook/email', async (req, res) => {
   try {
-    const { to, from, subject, text, html } = req.body;
+    let { to, from, subject, text, html } = req.body;
 
     // Verify webhook secret to prevent unauthorized posts
     const secret = req.headers['x-webhook-secret'];
@@ -154,6 +155,24 @@ app.post('/webhook/email', async (req, res) => {
 
     if (!to || !from) {
       return res.status(400).json({ error: 'Missing required fields: to, from' });
+    }
+
+    // Preferred path: the Cloudflare Worker sends the RAW email (base64) and
+    // we parse the MIME properly here. This yields clean text AND the real
+    // HTML body (the old worker-side extraction stripped tags, which made
+    // the in-app email view unreadable). Falls back to worker-provided
+    // text/html fields if raw parsing fails or isn't sent.
+    if (req.body.raw_base64) {
+      try {
+        const parsedMail = await simpleParser(Buffer.from(req.body.raw_base64, 'base64'));
+        subject = parsedMail.subject || subject || '';
+        text = parsedMail.text || text || '';
+        html = (typeof parsedMail.html === 'string' && parsedMail.html)
+          ? parsedMail.html
+          : (parsedMail.textAsHtml || html || '');
+      } catch (mimeErr) {
+        console.warn('Raw MIME parse failed, using provided fields:', mimeErr.message);
+      }
     }
 
     // The "to" address is the user's unique address, e.g. cliff.abc123@onthewayapp.net
