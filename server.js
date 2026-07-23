@@ -108,6 +108,31 @@ async function sendHouseholdPush(householdId, fallbackUserId, title, body) {
   }
 }
 
+// Store a copy of an email received at a user's tracking address so they can
+// view it in-app (Tracking Inbox). Fully guarded: storage failure must never
+// break package ingestion (also makes deploys independent of the table's
+// existence). Bodies are capped; emails older than 30 days are pruned
+// opportunistically per user (matches the privacy policy's retention).
+async function storeReceivedEmail(userId, { from, subject, text, html, isShipping, packageId }) {
+  try {
+    const { error } = await supabase.from('received_emails').insert({
+      user_id: userId,
+      from_addr: String(from || '').slice(0, 300),
+      subject: String(subject || '').slice(0, 500),
+      text_body: String(text || '').slice(0, 200000),
+      html_body: String(html || '').slice(0, 300000) || null,
+      is_shipping: !!isShipping,
+      package_id: packageId || null,
+    });
+    if (error) throw new Error(error.message);
+
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    await supabase.from('received_emails').delete().eq('user_id', userId).lt('received_at', cutoff);
+  } catch (e) {
+    console.warn('Received-email store skipped:', e.message);
+  }
+}
+
 // ─── Health Check ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'On the Way backend is running ✓', timestamp: new Date().toISOString() });
@@ -154,6 +179,9 @@ app.post('/webhook/email', async (req, res) => {
       console.log(
         `Ignoring non-shipping email for ${user.email} (from=${from}, subject=${subject})`
       );
+      // Still keep a copy for the in-app Tracking Inbox (helps users see why
+      // something didn't become a package).
+      await storeReceivedEmail(user.id, { from, subject, text, html, isShipping: false });
       return res.status(200).json({ message: 'Not a shipping email, ignoring' });
     }
 
@@ -256,6 +284,12 @@ app.post('/webhook/email', async (req, res) => {
         `${parsed.merchant || 'A package'}${parsed.carrier ? ` · ${parsed.carrier}` : ''}`
       );
     }
+
+    await storeReceivedEmail(user.id, {
+      from, subject, text, html,
+      isShipping: true,
+      packageId: packageRecord ? packageRecord.id : null,
+    });
 
     res.json({ success: true, package: packageRecord });
 
@@ -385,6 +419,104 @@ app.delete('/api/packages/:id', auth.authMiddleware, async (req, res) => {
 
   } catch (err) {
     console.error('Delete package error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ─── Tracking Inbox ─────────────────────────────────────────────────────────
+// View + forward access to emails received at the caller's tracking address.
+// Emails are user-private (NOT household-shared) so gift purchases made by
+// one member never leak to another through raw emails.
+
+// GET /api/emails — the caller's received emails, newest first (no bodies)
+app.get('/api/emails', auth.authMiddleware, async (req, res) => {
+  try {
+    const userId = auth.getUserId(req);
+    const { data, error } = await supabase
+      .from('received_emails')
+      .select('id, from_addr, subject, received_at, is_shipping, package_id')
+      .eq('user_id', userId)
+      .order('received_at', { ascending: false })
+      .limit(50);
+    if (error) throw new Error(error.message);
+    res.json(data || []);
+  } catch (err) {
+    console.error('List emails error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/emails/:id — one email with its text body (own emails only)
+app.get('/api/emails/:id', auth.authMiddleware, async (req, res) => {
+  try {
+    const userId = auth.getUserId(req);
+    const { data, error } = await supabase
+      .from('received_emails')
+      .select('id, from_addr, subject, received_at, is_shipping, package_id, text_body')
+      .eq('id', req.params.id)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!data) return res.status(404).json({ error: 'Email not found' });
+    res.json(data);
+  } catch (err) {
+    console.error('Get email error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/emails/:id/forward — forward the stored email to the caller's OWN
+// account email. Recipient is never caller-supplied (no spam-relay surface).
+app.post('/api/emails/:id/forward', auth.authMiddleware, async (req, res) => {
+  try {
+    const userId = auth.getUserId(req);
+
+    let toEmail = (req.user.email || '').trim();
+    if (!toEmail) {
+      const { data: profile } = await supabase.from('users').select('email').eq('id', userId).maybeSingle();
+      toEmail = profile && profile.email ? profile.email : '';
+    }
+    if (!toEmail) return res.status(400).json({ error: 'No account email on file' });
+
+    const { data: mail, error } = await supabase
+      .from('received_emails')
+      .select('from_addr, subject, received_at, text_body, html_body')
+      .eq('id', req.params.id)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!mail) return res.status(404).json({ error: 'Email not found' });
+
+    const apiKey = process.env.BREVO_API_KEY;
+    if (!apiKey) return res.status(503).json({ error: 'Email sending is not configured' });
+
+    const header =
+      `<p style="color:#64748b;font-size:13px;border-bottom:1px solid #e2e8f0;padding-bottom:8px;">` +
+      `Forwarded from your On the Way tracking inbox — originally from ` +
+      `<strong>${mail.from_addr}</strong> on ${new Date(mail.received_at).toLocaleString()}</p>`;
+    const bodyHtml = mail.html_body
+      ? header + mail.html_body
+      : header + `<pre style="white-space:pre-wrap;font-family:inherit;">${(mail.text_body || '')
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre>`;
+
+    const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': apiKey, 'Content-Type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        sender: { name: 'On the Way', email: 'support@onthewayapp.net' },
+        to: [{ email: toEmail }],
+        subject: `Fwd: ${mail.subject || '(no subject)'}`,
+        htmlContent: bodyHtml,
+      }),
+    });
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => '');
+      throw new Error(`Brevo send failed (${resp.status}): ${detail.slice(0, 200)}`);
+    }
+
+    res.json({ success: true, forwarded_to: toEmail });
+  } catch (err) {
+    console.error('Forward email error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
